@@ -14,7 +14,10 @@
 #include "constants/annotation_common.h"
 #include "core/fpdfapi/edit/cpdf_pagecontentgenerator.h"
 #include "core/fpdfapi/page/cpdf_annotcontext.h"
+#include "core/fpdfapi/page/cpdf_formobject.h"
 #include "core/fpdfapi/page/cpdf_form.h"
+#include "core/fpdfapi/page/cpdf_imageobject.h"
+#include "core/fpdfapi/page/cpdf_image.h" 
 #include "core/fpdfapi/page/cpdf_page.h"
 #include "core/fpdfapi/page/cpdf_pageobject.h"
 #include "core/fpdfapi/parser/cpdf_array.h"
@@ -734,6 +737,88 @@ std::optional<FX_COLORREF> GetWidgetFontColor(FPDF_FORMHANDLE handle,
   return widget ? widget->GetTextColor() : std::nullopt;
 }
 
+enum class EPDFStampFitCpp { kContain = 0, kCover = 1, kStretch = 2 };
+
+inline EPDFStampFitCpp ToCpp(EPDF_STAMP_FIT v) {
+  switch (v) {
+    case EPDF_STAMP_FIT_COVER:   return EPDFStampFitCpp::kCover;
+    case EPDF_STAMP_FIT_STRETCH: return EPDFStampFitCpp::kStretch;
+    case EPDF_STAMP_FIT_CONTAIN:
+    default:                     return EPDFStampFitCpp::kContain;
+  }
+}
+
+static bool FitImageIntoBox(float box_w, float box_h,
+                            float img_w, float img_h,
+                            EPDFStampFitCpp fit,
+                            float* out_drawn_w, float* out_drawn_h,
+                            float* out_dx, float* out_dy) {
+  if (box_w <= 0 || box_h <= 0 || img_w <= 0 || img_h <= 0) return false;
+
+  const float sx = box_w / img_w;
+  const float sy = box_h / img_h;
+
+  float scale_x, scale_y;
+  switch (fit) {
+    case EPDFStampFitCpp::kContain: {
+      float s = std::min(sx, sy);
+      scale_x = scale_y = s;
+      break;
+    }
+    case EPDFStampFitCpp::kCover: {
+      float s = std::max(sx, sy);
+      scale_x = scale_y = s;
+      break;
+    }
+    case EPDFStampFitCpp::kStretch:
+    default:
+      scale_x = sx;
+      scale_y = sy;
+      break;
+  }
+
+  *out_drawn_w = img_w * scale_x;
+  *out_drawn_h = img_h * scale_y;
+  *out_dx = (box_w - *out_drawn_w) * 0.5f;
+  *out_dy = (box_h - *out_drawn_h) * 0.5f;
+  return true;
+}
+
+static bool AccumulateSingleImageOnly(CPDF_Form* form,
+                                      CPDF_ImageObject** out,
+                                      int* image_count) {
+  for (const auto& obj : *form) {
+    if (!obj)
+      continue;
+
+    switch (obj->GetType()) {
+      case CPDF_PageObject::Type::kImage: {
+        if (++(*image_count) > 1)
+          return false;
+        *out = obj->AsImage();
+        break;
+      }
+
+      case CPDF_PageObject::Type::kForm: {
+        const CPDF_FormObject* fo = obj->AsForm();
+        const CPDF_Form* child = fo ? fo->form() : nullptr;
+        if (!child)
+          return false;
+        if (!AccumulateSingleImageOnly(const_cast<CPDF_Form*>(child), out, image_count))
+          return false;
+        break;
+      }
+
+      // Any other content disqualifies the AP from being resized by us.
+      case CPDF_PageObject::Type::kText:
+      case CPDF_PageObject::Type::kPath:
+      case CPDF_PageObject::Type::kShading:
+      default:
+        return false;
+    }
+  }
+  return true;
+}
 }  // namespace
 
 FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
@@ -3223,6 +3308,92 @@ EPDFAnnot_GetIcon(FPDF_ANNOTATION annot) {
   // Convert the name string to the internal enum, then cast to the public enum.
   CPDF_Annot::Icon internal_icon = CPDF_Annot::StringToIcon(icon_name);
   return static_cast<FPDF_ANNOT_ICON>(internal_icon);
+}
+
+FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
+EPDFAnnot_UpdateAppearanceToRect(FPDF_ANNOTATION annot, EPDF_STAMP_FIT fit) {
+  EPDFStampFitCpp fit_cpp = ToCpp(fit);
+
+  CPDF_AnnotContext* ctx = CPDFAnnotContextFromFPDFAnnotation(annot);
+  if (!ctx)
+    return false;
+
+  if (FPDFAnnot_GetSubtype(annot) != FPDF_ANNOT_STAMP)
+    return false;
+
+  RetainPtr<CPDF_Dictionary> ad = ctx->GetMutableAnnotDict();
+  if (!ad)
+    return false;
+
+  // 1) Target box from /Rect.
+  CFX_FloatRect rect = ad->GetRectFor(pdfium::annotation::kRect);
+  const float box_w = std::max(0.f, rect.Width());
+  const float box_h = std::max(0.f, rect.Height());
+  if (box_w <= 0 || box_h <= 0)
+    return false;
+
+  // 2) Fetch/create AP(N).
+  RetainPtr<CPDF_Stream> ap =
+      GetAnnotAP(ad.Get(), CPDF_Annot::AppearanceMode::kNormal);
+  if (!ap) {
+    CPDF_GenerateAP::GenerateEmptyAP(ctx->GetPage()->GetDocument(), ad.Get());
+    ap = GetAnnotAP(ad.Get(), CPDF_Annot::AppearanceMode::kNormal);
+    if (!ap)
+      return false;
+  }
+
+  // 3) Ensure CPDF_Form parsed.
+  if (!ctx->HasForm())
+    ctx->SetForm(ap);
+  CPDF_Form* form = ctx->GetForm();
+  if (!form)
+    return false;
+
+  // 4) Verify the AP tree is "exactly one image, nothing else".
+  int image_count = 0;
+  CPDF_ImageObject* image_obj = nullptr;
+  if (!AccumulateSingleImageOnly(form, &image_obj, &image_count) ||
+      image_count != 1 || !image_obj) {
+    // Mixed content, 0 images, or >1 image — leave AP untouched.
+    return true;
+  }
+
+  // 5) Update AP /BBox to [0 0 w h].
+  RetainPtr<CPDF_Dictionary> ap_dict = ap->GetMutableDict();
+  ap_dict->SetRectFor("BBox", CFX_FloatRect(0, 0, box_w, box_h));
+
+  // 6) Cleanup Resources/XObject *only when we will rewrite the content*.
+  // This prevents resource growth and also avoids nuking resources when we bail.
+  if (RetainPtr<CPDF_Dictionary> res = ap_dict->GetMutableDictFor("Resources"))
+    res->RemoveFor("XObject");
+
+  // 7) Intrinsic image size.
+  RetainPtr<CPDF_Image> img = image_obj->GetImage();
+  if (!img)
+    return false;
+  const float iw = static_cast<float>(img->GetPixelWidth());
+  const float ih = static_cast<float>(img->GetPixelHeight());
+  if (iw <= 0 || ih <= 0)
+    return false;
+
+  // 8) Compute placement matrix.
+  float drawn_w, drawn_h, dx, dy;
+  if (!FitImageIntoBox(box_w, box_h, iw, ih, fit_cpp,
+                       &drawn_w, &drawn_h, &dx, &dy)) {
+    return false;
+  }
+
+  // Clear any lingering clip on the single image; prevents cumulative 'W n'.
+  image_obj->mutable_clip_path() = CPDF_ClipPath();
+
+  // Apply matrix and update bounds.
+  CFX_Matrix m(drawn_w, 0, 0, drawn_h, dx, dy);
+  image_obj->SetImageMatrix(m);
+  image_obj->CalcBoundingBox();
+
+  // 9) Rewrite content stream from objects.
+  UpdateContentStream(form, ap.Get());
+  return true;
 }
 
 FPDF_EXPORT FPDF_ANNOTATION FPDF_CALLCONV

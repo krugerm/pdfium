@@ -211,6 +211,12 @@ typedef enum FPDF_ANNOT_ICON {
   FPDF_ANNOT_ICON_LAST = FPDF_ANNOT_ICON_Stamp_ForPublicRelease
 } FPDF_ANNOT_ICON;
 
+typedef enum EPDF_STAMP_FIT {
+  EPDF_STAMP_FIT_CONTAIN = 0,  // preserve aspect, fully visible
+  EPDF_STAMP_FIT_COVER   = 1,  // preserve aspect, fill box, might crop
+  EPDF_STAMP_FIT_STRETCH = 2   // ignore aspect, fill box
+} EPDF_STAMP_FIT;
+
 // Experimental API.
 // Check if an annotation subtype is currently supported for creation.
 // Currently supported subtypes:
@@ -1565,6 +1571,17 @@ EPDFAnnot_SetIcon(FPDF_ANNOTATION annot, FPDF_ANNOT_ICON icon);
 // Returns the icon.
 FPDF_EXPORT FPDF_ANNOT_ICON FPDF_CALLCONV
 EPDFAnnot_GetIcon(FPDF_ANNOTATION annot);
+
+// Experimental EmbedPDF Extension API.
+// Resize the normal appearance (/AP/N) of a Stamp to match the annotation's /Rect
+// using the specified fit policy. Updates the AP /BBox and the image's CTM.
+//
+//   annot - handle to a Stamp annotation.
+//   fit   - one of EPDF_STAMP_FIT_*.
+//
+// Returns true on success.
+FPDF_EXPORT FPDF_BOOL FPDF_CALLCONV
+EPDFAnnot_UpdateAppearanceToRect(FPDF_ANNOTATION annot, EPDF_STAMP_FIT fit);
 
 // Experimental EmbedPDF Extension API.
 // Create an annotation. (the difference from FPDFPage_CreateAnnot is that it creates an indirect object)
