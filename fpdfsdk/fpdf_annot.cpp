@@ -6,12 +6,18 @@
 
 #include <array>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <utility>
 #include <vector>
 #include <algorithm>
 
 #include "constants/annotation_common.h"
+#include "constants/annotation_flags.h"
+#include "constants/appearance.h"
+#include "constants/form_fields.h"
+#include "constants/form_flags.h"
+#include "constants/transparency.h"
 #include "core/fpdfapi/edit/cpdf_pagecontentgenerator.h"
 #include "core/fpdfapi/page/cpdf_annotcontext.h"
 #include "core/fpdfapi/page/cpdf_formobject.h"
@@ -49,6 +55,48 @@
 #include "fpdfsdk/cpdfsdk_interactiveform.h"
 
 namespace {
+
+std::optional<FormFieldType> GetFormFieldTypeFromDict(
+    const CPDF_Dictionary* dict) {
+  if (!dict) {
+    return std::nullopt;
+  }
+
+  RetainPtr<const CPDF_Object> ft_obj =
+      CPDF_FormField::GetFieldAttrForDict(dict, pdfium::form_fields::kFT);
+  ByteString type_name = ft_obj ? ft_obj->GetString() : ByteString();
+  if (type_name.IsEmpty()) {
+    return std::nullopt;
+  }
+
+  if (type_name == pdfium::form_fields::kTx) {
+    return FormFieldType::kTextField;
+  }
+  if (type_name == pdfium::form_fields::kSig) {
+    return FormFieldType::kSignature;
+  }
+
+  RetainPtr<const CPDF_Object> ff_obj =
+      CPDF_FormField::GetFieldAttrForDict(dict, pdfium::form_fields::kFf);
+  uint32_t flags = ff_obj ? ff_obj->GetInteger() : 0;
+
+  if (type_name == pdfium::form_fields::kBtn) {
+    if (flags & pdfium::form_flags::kButtonRadio) {
+      return FormFieldType::kRadioButton;
+    }
+    if (flags & pdfium::form_flags::kButtonPushbutton) {
+      return FormFieldType::kPushButton;
+    }
+    return FormFieldType::kCheckBox;
+  }
+  if (type_name == pdfium::form_fields::kCh) {
+    if (flags & pdfium::form_flags::kChoiceCombo) {
+      return FormFieldType::kComboBox;
+    }
+    return FormFieldType::kListBox;
+  }
+  return std::nullopt;
+}
 
 // These checks ensure the consistency of annotation subtype values across core/
 // and public.
@@ -1820,7 +1868,22 @@ FPDFAnnot_GetFormFieldName(FPDF_FORMHANDLE hHandle,
 FPDF_EXPORT int FPDF_CALLCONV
 FPDFAnnot_GetFormFieldType(FPDF_FORMHANDLE hHandle, FPDF_ANNOTATION annot) {
   const CPDF_FormField* pFormField = GetFormField(hHandle, annot);
-  return pFormField ? static_cast<int>(pFormField->GetFieldType()) : -1;
+  if (pFormField) {
+    FormFieldType field_type = pFormField->GetFieldType();
+    if (field_type != FormFieldType::kUnknown) {
+      return static_cast<int>(field_type);
+    }
+    if (auto type =
+            GetFormFieldTypeFromDict(pFormField->GetFieldDict().Get())) {
+      return static_cast<int>(*type);
+    }
+  }
+
+  const CPDF_Dictionary* annot_dict = GetAnnotDictFromFPDFAnnotation(annot);
+  if (auto type = GetFormFieldTypeFromDict(annot_dict)) {
+    return static_cast<int>(*type);
+  }
+  return -1;
 }
 
 FPDF_EXPORT unsigned long FPDF_CALLCONV
