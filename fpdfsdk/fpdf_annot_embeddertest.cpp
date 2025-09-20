@@ -7,6 +7,7 @@
 #include <limits.h>
 
 #include <algorithm>
+#include <array>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -2999,6 +3000,31 @@ TEST_F(FPDFAnnotEmbedderTest, GetFormFieldType) {
     ASSERT_TRUE(annot);
     EXPECT_EQ(test.output,
               FPDFAnnot_GetFormFieldType(form_handle(), annot.get()));
+  }
+}
+
+TEST_F(FPDFAnnotEmbedderTest, GetFormFieldTypeBugFormFieldType) {
+  ASSERT_TRUE(OpenDocument("bug_form-field-type.pdf"));
+  ScopedPage page = LoadScopedPage(0);
+  ASSERT_TRUE(page);
+
+  const int expected_types[] = {
+      FPDF_FORMFIELD_TEXTFIELD,   FPDF_FORMFIELD_CHECKBOX,
+      FPDF_FORMFIELD_RADIOBUTTON, FPDF_FORMFIELD_RADIOBUTTON,
+      FPDF_FORMFIELD_RADIOBUTTON, FPDF_FORMFIELD_COMBOBOX,
+      FPDF_FORMFIELD_TEXTFIELD,   FPDF_FORMFIELD_TEXTFIELD,
+      FPDF_FORMFIELD_TEXTFIELD,   FPDF_FORMFIELD_TEXTFIELD,
+      FPDF_FORMFIELD_TEXTFIELD,   FPDF_FORMFIELD_TEXTFIELD};
+
+  const int annot_count = FPDFPage_GetAnnotCount(page.get());
+  ASSERT_EQ(static_cast<int>(std::size(expected_types)), annot_count);
+
+  for (int i = 0; i < annot_count; ++i) {
+    ScopedFPDFAnnotation annot(FPDFPage_GetAnnot(page.get(), i));
+    ASSERT_TRUE(annot);
+    EXPECT_EQ(expected_types[i],
+              FPDFAnnot_GetFormFieldType(form_handle(), annot.get()))
+        << "Unexpected type for annotation index " << i;
   }
 }
 
